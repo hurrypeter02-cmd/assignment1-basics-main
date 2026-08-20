@@ -161,3 +161,7 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+# Local datasets and blog evidence artifacts
+data/
+blog_assets/

@@ -1,4 +1,5 @@
 import regex as re
+import json
 from collections import Counter,defaultdict
 
 
@@ -94,9 +95,7 @@ def merge(old_ids,unique_token_list,new_idx,stats,pair_to_token):
         # 更新 相关变量
     return unique_token_list,stats,pair_to_token,changed_pairs
 
-def run_train_bpe(input_path,vocab_size,special_tokens):
-    with open(input_path,'r',encoding='utf-8') as f:
-        text = f.read()
+def init_text(text,special_tokens):
     new_st = []
     for st in special_tokens:
         st = re.escape(st)
@@ -107,7 +106,13 @@ def run_train_bpe(input_path,vocab_size,special_tokens):
     gpt2pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
     for text in text_list:
         new_text_list.extend(re.findall(gpt2pat, text))
+    return new_text_list
     # 根据 special_tokens 和 GPT-2 正则进行预分词, 不同 pre-token 之间不能合并
+
+def run_train_bpe(input_path,vocab_size,special_tokens):
+    with open(input_path,'r',encoding='utf-8') as f:
+        text = f.read()
+    new_text_list = init_text(text,special_tokens)
 
     unique_token_list = Counter(tuple(text.encode("utf-8")) for text in new_text_list)
     # 将去重后的 text 转换成 token tuple, 并用 Counter 统计重复次数
@@ -150,3 +155,132 @@ def run_train_bpe(input_path,vocab_size,special_tokens):
 
     # vocab 和 merges 在训练过程中同步维护, 保证 tie-break 能按 bytes 比较, 并直接得到测试要求的 bytes merges
     return vocab,merge_dic
+
+class Tokenizer:
+    def __init__(self,vocab,merge_dic,special_tokens=None):
+        self.vocab = vocab
+        self.rev_vocab = {v:k for k,v in vocab.items()}
+        # 翻转 vocab ,方便后续 encode 从 bytes 找到 token_id
+        self.merge_dic = merge_dic
+        self.special_tokens = special_tokens or []
+        if self.special_tokens:
+            self.special_tokens.sort(key=len,reverse=True)
+        self.set_special_tokens = set(self.special_tokens)
+
+        new_st = []
+        for st in self.special_tokens:
+            st = re.escape(st)
+            new_st.append(st)
+        self.split_parten = ("("+"|".join(new_st)+")") if new_st else []
+        
+        self.gpt2pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+    @classmethod
+    def from_files(cls,vocab_filepath,merges_filepath,special_tokens=None):
+        with open(vocab_filepath,"r",encoding = "utf-8") as f:
+            vocab0 = json.load(f)
+            vocab = {token:bytes(bytes_list) for token,bytes_list in enumerate(vocab0)}
+        with open(merges_filepath,"r",encoding = "utf-8") as f:
+            merge0 = json.load(f)
+            merge = [(bytes(left),bytes(right)) for left,right in merge0]
+        return cls(vocab,merge,special_tokens)
+        """
+        内存里
+        • vocab: dict[int, bytes]
+        • merges: list[tuple[bytes, bytes]]
+        文件里
+        • vocab.json 用 list[list[int]]，下标就是 token id
+        • merges.json 用 list[[list[int], list[int]]]
+        • special_tokens 单独存/单独传，类型用 list[str]
+        例如：
+        vocab:
+        [
+        [0],
+        [1],
+        [97],
+        [97, 98]
+        ]
+        merges:
+        [
+        [[97], [98]],
+        [[97, 98], [99]]
+        ]
+        """   
+
+    def encode(self,text):
+        if self.split_parten:
+            text_list = re.split(self.split_parten,text)    
+            new_text_list = []
+            for text in text_list:
+                if text in self.set_special_tokens:
+                    new_text_list.append(self.rev_vocab[text.encode("utf-8")])
+                    continue
+                sub_text_list = [text0.encode("utf-8") for text0 in re.findall(self.gpt2pat,text)]   
+                new_text_list.extend(sub_text_list)
+        else:
+            new_text_list = [text0.encode("utf-8") for text0 in re.findall(self.gpt2pat,text)]
+
+        text_list = new_text_list
+        # 正则化
+
+        token_list = []
+        for text in text_list:
+            if isinstance(text,int):
+                token_list.append(text)
+                continue
+            new_token = []
+            for text0 in text:
+                new_token.append(bytes([text0]))
+            token_list.append(new_token)
+        # 把特殊字符串直接转成 token_id
+
+        pair_to_token = defaultdict(set)
+        for idx,token in enumerate(token_list):
+            if isinstance(token,int):
+                continue
+            for pair in zip(token,token[1:]):
+                pair_to_token[pair].add(idx)
+
+        for merged_pair in self.merge_dic:
+            old_idx1 = merged_pair[0]
+            old_idx2 = merged_pair[1]
+            new_bytes = b"".join(merged_pair)
+            if  merged_pair not in pair_to_token:
+                continue
+            for affected_token_idx in list(pair_to_token[merged_pair]):
+                token = token_list[affected_token_idx]
+                new_token = []
+                i = 0
+                while(i<len(token)):
+                    if(i<len(token)-1 and token[i] == old_idx1 and token[i+1] == old_idx2):
+                        new_token.append(new_bytes)
+                        i += 2
+                    else:
+                        new_token.append(token[i])
+                        i += 1
+                token_list[affected_token_idx] = new_token
+                for pair in zip(token,token[1:]):
+                    if pair not in pair_to_token:
+                        continue
+                    pair_to_token[pair].discard(affected_token_idx)
+                    if not pair_to_token[pair]:
+                        del pair_to_token[pair]
+                for pair in zip(new_token,new_token[1:]):
+                    pair_to_token[pair].add(affected_token_idx)
+
+        fin_token = []
+        for token in token_list:
+            if isinstance(token, int):
+                fin_token.append(token)
+                continue
+            for byte in token:
+                fin_token.append(self.rev_vocab[byte])
+        return fin_token
+
+    def decode(self,ids):
+        text_bytes = b"".join(self.vocab[idx] for idx in ids)
+        return text_bytes.decode("utf-8",errors="replace")
+
+    def encode_iterable(self,iterable):
+        for text in iterable:
+            token = self.encode(text)
+            yield from token

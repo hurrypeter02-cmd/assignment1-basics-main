@@ -82,3 +82,59 @@ class RotaryPositionalEmbedding(nn.Module):
         y = torch.stack([new_x1,new_x2],dim=-1).view(*x.shape[:-1],-1)
         return y
 
+def softmax(in_features,dim):
+    max_feature,_ = torch.max(in_features,dim=dim,keepdim=True)
+    nor_features = in_features - max_feature
+    e_features = torch.exp(nor_features)
+    sum_features = torch.sum(e_features,dim=dim,keepdim=True)
+    out_features = e_features/sum_features
+    return out_features
+
+def scaled_dot_product_attention(Q,K,V,mask=None):
+    logits = torch.einsum("...ij,...kj->...ik",Q,K) * (Q.shape[-1]**-0.5)
+    if mask is None:
+            ones = torch.ones_like(logits)
+            tril = torch.tril(ones)
+            mask = tril==1
+    logits = logits.masked_fill(~mask,float("-inf"))
+    pro = softmax(logits,dim=-1)
+    atten = torch.einsum("...ij,...jk -> ...ik",pro,V)
+    return atten
+
+def multihead_self_attention(d_model: int,num_heads: int,q_proj_weight: float,k_proj_weight: float,v_proj_weight: float,o_proj_weight: float,in_features: float) -> float:
+    Q = torch.einsum("...ij,kj -> ...ik",in_features,q_proj_weight)
+    K = torch.einsum("...ij,kj -> ...ik",in_features,k_proj_weight)
+    V = torch.einsum("...ij,kj -> ...ik",in_features,v_proj_weight)
+
+    assert d_model%num_heads==0
+    head_size = d_model//num_heads
+    shape = Q.shape[:-1]
+    split_Q = Q.view(*shape,num_heads,head_size).transpose(-3,-2)
+    split_K = K.view(*shape,num_heads,head_size).transpose(-3,-2)
+    split_V = V.view(*shape,num_heads,head_size).transpose(-3,-2)
+
+    atten = scaled_dot_product_attention(split_Q,split_K,split_V).transpose(-3,-2).reshape(*shape,-1)
+    out_features = torch.einsum("...ij,kj -> ...ik",atten,o_proj_weight)
+
+    return out_features
+
+def multihead_self_attention_with_rope(d_model: int,num_heads: int,max_seq_len:int,theta:float,q_proj_weight: float,k_proj_weight: float,v_proj_weight: float,o_proj_weight: float,in_features: float,token_positions:int) -> float:
+    Q = torch.einsum("...ij,kj -> ...ik",in_features,q_proj_weight)
+    K = torch.einsum("...ij,kj -> ...ik",in_features,k_proj_weight)
+    V = torch.einsum("...ij,kj -> ...ik",in_features,v_proj_weight)
+
+    assert d_model%num_heads==0
+    head_size = d_model//num_heads
+    shape = Q.shape[:-1]
+    split_Q = Q.view(*shape,num_heads,head_size).transpose(-3,-2)
+    split_K = K.view(*shape,num_heads,head_size).transpose(-3,-2)
+    split_V = V.view(*shape,num_heads,head_size).transpose(-3,-2)
+
+    rope = RotaryPositionalEmbedding(theta,head_size,max_seq_len)
+    out_query = rope(split_Q,token_positions)
+    out_key = rope(split_K,token_positions)
+
+    atten = scaled_dot_product_attention(out_query,out_key,split_V).transpose(-3,-2).reshape(*shape,-1)
+    out_features = torch.einsum("...ij,kj -> ...ik",atten,o_proj_weight)
+
+    return out_features

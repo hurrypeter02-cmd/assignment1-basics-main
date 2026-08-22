@@ -20,8 +20,9 @@ from cs336_basics.transformer import (
     RotaryPositionalEmbedding,
     softmax,
     scaled_dot_product_attention,
-    multihead_self_attention,
-    multihead_self_attention_with_rope,
+    MHA,
+    transformer_block,
+    transformer_lm
 )
 
 
@@ -163,7 +164,15 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    return multihead_self_attention(d_model,num_heads,q_proj_weight,k_proj_weight,v_proj_weight,o_proj_weight,in_features)
+    mha = MHA(d_model,num_heads)
+    # QKV_proj = torch.cat([q_proj_weight,k_proj_weight,v_proj_weight],dim=-2)
+    # mha.QKV_proj.weight.data = QKV_proj
+    mha.q_proj.weight.data = q_proj_weight
+    mha.k_proj.weight.data = k_proj_weight
+    mha.v_proj.weight.data = v_proj_weight
+    mha.output_proj.weight.data = o_proj_weight
+    out_features = mha(in_features)
+    return out_features
 
 
 def run_multihead_self_attention_with_rope(
@@ -203,11 +212,15 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    return multihead_self_attention_with_rope(
-        d_model, num_heads, max_seq_len, theta,
-        q_proj_weight, k_proj_weight, v_proj_weight, o_proj_weight,
-        in_features, token_positions
-    )
+    mha = MHA(d_model,num_heads,is_rope=True,theta=theta,max_seq_len=max_seq_len)
+    # QKV_proj = torch.cat([q_proj_weight,k_proj_weight,v_proj_weight],dim=-2)
+    # mha.QKV_proj.weight.data = QKV_proj
+    mha.q_proj.weight.data = q_proj_weight
+    mha.k_proj.weight.data = k_proj_weight
+    mha.v_proj.weight.data = v_proj_weight
+    mha.output_proj.weight.data = o_proj_weight
+    out_features = mha(in_features,token_positions=token_positions)
+    return out_features
 
 
 def run_rope(
@@ -230,9 +243,8 @@ def run_rope(
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
     rope = RotaryPositionalEmbedding(theta,d_k,max_seq_len)
-    out_query_or_key = rope(in_query_or_key,token_positions)
+    out_query_or_key = rope(in_query_or_key, token_positions=token_positions)
     return out_query_or_key
-
 
 def run_transformer_block(
     d_model: int,
@@ -304,7 +316,16 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    tb = transformer_block(d_model,d_ff,num_heads,max_seq_len,theta)
+
+    sd = tb.state_dict()
+    sd_keys = weights.keys()
+    for key in sd_keys:
+        sd[key].data.copy_(weights[key])
+
+    out_features = tb(in_features)
+
+    return out_features
 
 
 def run_transformer_lm(
@@ -386,7 +407,20 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    tbl = transformer_lm(
+        vocab_size,context_length,
+        d_model,num_layers,num_heads,
+        d_ff,rope_theta
+    )
+
+    sd = tbl.state_dict()
+    sd_keys = weights.keys()
+    for key in sd_keys:
+        sd[key].data.copy_(weights[key])
+
+    out_indices = tbl(in_indices)
+
+    return out_indices
 
 
 def run_rmsnorm(

@@ -12,7 +12,7 @@ class Linear(nn.Module):
         self.weight = nn.Parameter(self.weight)
         nn.init.trunc_normal_(self.weight,mean=0.0,std=std,a=trunc_lower,b=trunc_upper)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = torch.einsum("...j,kj -> ...k",[x,self.weight]) 
+        y = torch.einsum("...j,kj -> ...k",x,self.weight) 
         # y = x @ self.weight.T
         return y
 
@@ -31,7 +31,7 @@ class Embedding(nn.Module):
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
         super().__init__()
-        self.weight = torch.ones(d_model,device=device,dtype=dtype)
+        self.weight = nn.Parameter(torch.ones(d_model,device=device,dtype=dtype))
         self.d_model = d_model
         self.eps = eps
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -69,7 +69,7 @@ class RotaryPositionalEmbedding(nn.Module):
         mtheta = torch.einsum("i,j->ij",seq_pos,freq)
         self.register_buffer("mtheta",mtheta)
 
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,*, token_positions: torch.Tensor) -> torch.Tensor:
         # x shape: (*, seq_len, d_k)
         pos_mtheta = self.mtheta[token_positions]
         new_x = x.view(*x.shape[:-1],-1,2)
@@ -101,40 +101,65 @@ def scaled_dot_product_attention(Q,K,V,mask=None):
     atten = torch.einsum("...ij,...jk -> ...ik",pro,V)
     return atten
 
-def multihead_self_attention(d_model: int,num_heads: int,q_proj_weight: float,k_proj_weight: float,v_proj_weight: float,o_proj_weight: float,in_features: float) -> float:
-    Q = torch.einsum("...ij,kj -> ...ik",in_features,q_proj_weight)
-    K = torch.einsum("...ij,kj -> ...ik",in_features,k_proj_weight)
-    V = torch.einsum("...ij,kj -> ...ik",in_features,v_proj_weight)
+class MHA(nn.Module):
+    def __init__(self,d_model,num_heads,*,is_rope=False,theta=None,max_seq_len=None):
+        super().__init__()
+        self.d_model = d_model
+        # self.QKV_proj = Linear(d_model,3*d_model)
+        self.q_proj = Linear(d_model,d_model)
+        self.k_proj = Linear(d_model,d_model)
+        self.v_proj = Linear(d_model,d_model)
+        self.output_proj = Linear(d_model,d_model)
+        assert d_model%num_heads==0
+        self.num_heads = num_heads
+        self.head_size = d_model//num_heads
+        self.is_rope = is_rope
+        if is_rope:
+            self.rope = RotaryPositionalEmbedding(theta,self.head_size,max_seq_len)
+    def forward(self,in_features,*,token_positions=None):
+        Q,K,V = self.q_proj(in_features),self.k_proj(in_features),self.v_proj(in_features)
+        shape = Q.shape[:-1]
+        split_or_rope_Q = Q.view(*shape,self.num_heads,self.head_size).transpose(-3,-2)
+        split_or_rope_K = K.view(*shape,self.num_heads,self.head_size).transpose(-3,-2)
+        split_V = V.view(*shape,self.num_heads,self.head_size).transpose(-3,-2)
 
-    assert d_model%num_heads==0
-    head_size = d_model//num_heads
-    shape = Q.shape[:-1]
-    split_Q = Q.view(*shape,num_heads,head_size).transpose(-3,-2)
-    split_K = K.view(*shape,num_heads,head_size).transpose(-3,-2)
-    split_V = V.view(*shape,num_heads,head_size).transpose(-3,-2)
+        if self.is_rope:
+            token_positions = torch.arange(Q.shape[-2]) if token_positions is None else token_positions
+            split_or_rope_Q = self.rope(split_or_rope_Q,token_positions=token_positions)
+            split_or_rope_K = self.rope(split_or_rope_K,token_positions=token_positions)
 
-    atten = scaled_dot_product_attention(split_Q,split_K,split_V).transpose(-3,-2).reshape(*shape,-1)
-    out_features = torch.einsum("...ij,kj -> ...ik",atten,o_proj_weight)
+        atten = scaled_dot_product_attention(split_or_rope_Q,split_or_rope_K,split_V).transpose(-3,-2).reshape(*shape,-1)
+        out_features = self.output_proj(atten)
 
-    return out_features
+        return out_features
 
-def multihead_self_attention_with_rope(d_model: int,num_heads: int,max_seq_len:int,theta:float,q_proj_weight: float,k_proj_weight: float,v_proj_weight: float,o_proj_weight: float,in_features: float,token_positions:int) -> float:
-    Q = torch.einsum("...ij,kj -> ...ik",in_features,q_proj_weight)
-    K = torch.einsum("...ij,kj -> ...ik",in_features,k_proj_weight)
-    V = torch.einsum("...ij,kj -> ...ik",in_features,v_proj_weight)
+class transformer_block(nn.Module):
+    def __init__(self,d_model,d_ff,num_heads,max_seq_len,theta):
+        super().__init__()
+        self.ln1 = RMSNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+        self.attn = MHA(d_model,num_heads,is_rope=True,theta=theta,max_seq_len=max_seq_len)
+        self.ffn = SwiGLU(d_model,d_ff)
+    def forward(self,in_features):
+        x = in_features
+        z = x + self.attn(self.ln1(x))
+        y = z + self.ffn(self.ln2(z))
+        return y
 
-    assert d_model%num_heads==0
-    head_size = d_model//num_heads
-    shape = Q.shape[:-1]
-    split_Q = Q.view(*shape,num_heads,head_size).transpose(-3,-2)
-    split_K = K.view(*shape,num_heads,head_size).transpose(-3,-2)
-    split_V = V.view(*shape,num_heads,head_size).transpose(-3,-2)
+class transformer_lm(nn.Module):
+    def __init__(
+        self,vocab_size,context_length,
+        d_model,num_layers,num_heads,
+        d_ff,rope_theta
+    ):
+        super().__init__()
+        self.token_embeddings = Embedding(vocab_size,d_model)
+        self.layers = nn.Sequential(*[transformer_block(d_model,d_ff,num_heads,context_length,rope_theta) for _ in range(num_layers)])
+        self.ln_final = RMSNorm(d_model)
+        self.lm_head = Linear(d_model,vocab_size)
 
-    rope = RotaryPositionalEmbedding(theta,head_size,max_seq_len)
-    out_query = rope(split_Q,token_positions)
-    out_key = rope(split_K,token_positions)
-
-    atten = scaled_dot_product_attention(out_query,out_key,split_V).transpose(-3,-2).reshape(*shape,-1)
-    out_features = torch.einsum("...ij,kj -> ...ik",atten,o_proj_weight)
-
-    return out_features
+    def forward(self,in_indices):
+        token = self.token_embeddings(in_indices)
+        layers_out = self.layers(token)
+        out_indices = self.lm_head(self.ln_final(layers_out))
+        return out_indices
